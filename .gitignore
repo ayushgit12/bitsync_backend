@@ -1,0 +1,8 @@
+/node_modules
+/specs/known-issues/
+/specs/features/
+
+/src/generated/prisma
+.env
+.env.prod
+/dist

@@ -1,0 +1,470 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email              String   @unique @db.VarChar(255)
+  username           String   @db.VarChar(39)
+  usernameNormalized String   @unique @map("username_normalized") @db.VarChar(39)
+  displayName        String   @map("display_name") @db.VarChar(100)
+  avatarUrl          String?  @map("avatar_url")
+  passwordHash       String?  @map("password_hash") // NULL if user signed up via OAuth only
+  emailVerified      Boolean  @default(false) @map("email_verified")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  refreshTokens         RefreshToken[]
+  ownedRepos            Repository[]   @relation("RepoOwner")
+  repoMemberships       RepoMember[]
+  notificationsReceived Notification[] @relation("NotificationRecipient")
+  notificationsActed    Notification[] @relation("NotificationActor")
+  workspaces            Workspace[]
+  pullRequests          PullRequest[]  @relation("PrAuthor")
+  prReviews             PrReview[]
+  prComments            PrComment[]
+
+  @@index([email])
+  @@map("users")
+}
+
+model RefreshToken {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
+  deviceInfo String?   @map("device_info") @db.VarChar(255)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz
+  revoked    Boolean   @default(false)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+model Repository {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String   @db.VarChar(255)
+  nameNormalized String   @map("name_normalized") @db.VarChar(255)
+  description    String?  @db.Text
+  ownerId        String   @map("owner_id") @db.Uuid
+  headCommit     String?  @map("head_commit") @db.Text
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  owner         User          @relation("RepoOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  headCommitRef Commit?       @relation("RepoHeadCommit", fields: [headCommit], references: [commitHash])
+  members       RepoMember[]
+  workspaces    Workspace[]
+  pullRequests  PullRequest[]
+
+  @@unique([ownerId, nameNormalized])
+  @@index([ownerId])
+  @@map("repositories")
+}
+
+enum RepoRole {
+  owner
+  admin
+  member
+
+  @@map("repo_role")
+}
+
+model RepoMember {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  repoId    String    @map("repo_id") @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  role      RepoRole  @default(member)
+  joinedAt  DateTime  @default(now()) @map("joined_at") @db.Timestamptz
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz
+
+  repo Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  user User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([repoId, userId])
+  @@index([repoId])
+  @@index([userId])
+  @@map("repo_members")
+}
+
+enum NotificationType {
+  repo_invite
+  invite_accepted
+  invite_declined
+  pr_created
+  pr_merged
+  pr_rejected
+  pr_reviewed
+  pr_reverted
+  merge_conflicts
+  member_removed
+  role_changed
+
+  @@map("notification_type")
+}
+
+model Notification {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid // recipient (inbox owner)
+  actorId   String?          @map("actor_id") @db.Uuid // who triggered it; null for system events
+  type      NotificationType
+  title     String           @db.VarChar(255)
+  body      String?          @db.Text
+  data      Json? // structured payload: repoId, role, prId, etc. (snapshot, no FK)
+  isRead    Boolean          @default(false) @map("is_read")
+  expiresAt DateTime?        @map("expires_at") @db.Timestamptz // set for repo_invite; powers expiry cleanup
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz
+
+  user  User  @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  actor User? @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version Control — Object Storage (specs/04_version_control/01_storage)
+// All hashes are SHA-256, 64-char lowercase hex, stored as TEXT.
+// Blobs, trees, and commits are immutable — only created, never updated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Raw file content, content-addressed. Identical content = one row (dedup).
+model Blob {
+  blobHash String @id @map("blob_hash") @db.Text // SHA256("blob\0" + size + "\0" + content)
+  size     BigInt
+  // Content lives in Cloudinary (authenticated raw resource, public_id == blobHash),
+  // not in the DB. The row's existence means "content is stored"; the delivery
+  // location is derived from the hash, so no url/key column is needed.
+
+  workspaceChanges WorkspaceChange[]
+  conflictBases    MergeConflict[]   @relation("ConflictBaseBlob")
+  conflictOurs     MergeConflict[]   @relation("ConflictOursBlob")
+  conflictTheirs   MergeConflict[]   @relation("ConflictTheirsBlob")
+  conflictResolved MergeConflict[]   @relation("ConflictResolvedBlob")
+
+  @@map("blobs")
+}
+
+// A directory (Folder). Identity is fully determined by its children (Merkle hash).
+model Tree {
+  treeHash String @id @map("tree_hash") @db.Text // SHA256("tree\0" + sorted child strings)
+
+  entries     TreeEntry[]
+  commits     Commit[]     @relation("CommitRootTree")
+  mergeStates MergeState[] @relation("MergeStateMergedTree")
+
+  @@map("trees")
+}
+
+enum EntryType {
+  blob
+  tree
+
+  @@map("entry_type")
+}
+
+// A single entry within a directory — a file (blob) or subdirectory (tree).
+model TreeEntry {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  parentTree String    @map("parent_tree") @db.Text
+  entryType  EntryType @map("entry_type")
+  name       String    @db.Text
+  // Polymorphic reference — blobs.blob_hash when entryType=blob, trees.tree_hash
+  // when entryType=tree. No DB-level FK possible; always check entryType first.
+  objectHash String    @map("object_hash") @db.Text
+
+  tree Tree @relation(fields: [parentTree], references: [treeHash], onDelete: Cascade)
+
+  @@unique([parentTree, name])
+  @@map("tree_entries")
+}
+
+// A snapshot of the entire repo at a point in time.
+model Commit {
+  commitHash        String   @id @map("commit_hash") @db.Text // SHA256("commit\0" + byte_length + "\0" + content)
+  rootTree          String   @map("root_tree") @db.Text
+  parent            String?  @db.Text // NULL for the initial commit; merge commits also record all parents in commit_parents
+  author            String   @db.Text
+  timestamp         DateTime @db.Timestamptz
+  message           String   @db.Text
+  // Permanent provenance — where the commit was created. Never mutated by the
+  // app (NULL = main-line merge/revert commit); SetNull only on workspace deletion.
+  parentWorkspaceId String?  @map("parent_workspace_id") @db.Uuid
+
+  rootTreeRef     Tree       @relation("CommitRootTree", fields: [rootTree], references: [treeHash])
+  parentRef       Commit?    @relation("CommitParentChain", fields: [parent], references: [commitHash], onDelete: NoAction, onUpdate: NoAction)
+  childCommits    Commit[]   @relation("CommitParentChain")
+  parentWorkspace Workspace? @relation("CommitProvenance", fields: [parentWorkspaceId], references: [id], onDelete: SetNull)
+
+  mergeParents CommitParent[] @relation("MergeCommit") // rows where this commit is the merge commit
+  mergeUses    CommitParent[] @relation("MergeParent") // rows where this commit is a parent of a merge commit
+
+  repoHeads           Repository[]  @relation("RepoHeadCommit")
+  workspaceForkPoints Workspace[]   @relation("WorkspaceForkPoint")
+  workspaceHeads      Workspace[]   @relation("WorkspaceHead")
+  prHeads             PullRequest[] @relation("PrHeadCommit")
+  prBases             PullRequest[] @relation("PrBaseCommit")
+  prMerges            PullRequest[] @relation("PrMergeCommit")
+  mergeStateBases     MergeState[]  @relation("MergeStateBase")
+  mergeStateOurs      MergeState[]  @relation("MergeStateOurs")
+  mergeStateTheirs    MergeState[]  @relation("MergeStateTheirs")
+
+  @@index([parent])
+  @@index([parentWorkspaceId])
+  @@map("commits")
+}
+
+// All parents of a merge commit, ordered. Ordinal 0 = main-line (ours),
+// ordinal 1 = the branch merged in (theirs). Regular commits have no rows
+// here — get_all_parents() falls back to commits.parent.
+model CommitParent {
+  commitHash String @map("commit_hash") @db.Text
+  parentHash String @map("parent_hash") @db.Text
+  ordinal    Int
+
+  commit Commit @relation("MergeCommit", fields: [commitHash], references: [commitHash], onDelete: Cascade)
+  parent Commit @relation("MergeParent", fields: [parentHash], references: [commitHash], onDelete: NoAction, onUpdate: NoAction)
+
+  @@id([commitHash, ordinal])
+  @@index([parentHash])
+  @@map("commit_parents")
+}
+
+enum WorkspaceStatus {
+  CLEAN
+  MERGING
+  CONFLICTED
+
+  @@map("workspace_status")
+}
+
+// A user's working copy of a repo. Always forked from repo HEAD; reusable after merge.
+model Workspace {
+  id        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  repoId    String          @map("repo_id") @db.Uuid
+  userId    String          @map("user_id") @db.Uuid
+  name      String          @db.VarChar(255)
+  // Creation-time record only — NEVER used as merge base (always computed via
+  // merge_base()). NULL when the workspace was forked from an empty repo.
+  forkPoint String?         @map("fork_point") @db.Text
+  head      String?         @db.Text // current tip; NULL until first commit on an empty-repo workspace
+  status    WorkspaceStatus @default(CLEAN)
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  repo         Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  forkPointRef Commit?    @relation("WorkspaceForkPoint", fields: [forkPoint], references: [commitHash])
+  headRef      Commit?    @relation("WorkspaceHead", fields: [head], references: [commitHash])
+
+  changes      WorkspaceChange[]
+  pullRequests PullRequest[]
+  mergeStates  MergeState[]
+  commits      Commit[]          @relation("CommitProvenance")
+
+  @@index([repoId])
+  @@index([userId])
+  @@map("workspaces")
+}
+
+enum ChangeAction {
+  ADD
+  MODIFY
+  DELETE
+
+  @@map("change_action")
+}
+
+// Uncommitted changes — the dirty working directory (no staging area).
+// Cleared when baked into a commit. UPSERT per (workspace, path), last-write-wins.
+model WorkspaceChange {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String       @map("workspace_id") @db.Uuid
+  // Relative to repo root: forward slashes, no leading/trailing slash, no "..".
+  filePath    String       @map("file_path") @db.Text
+  action      ChangeAction
+  blobHash    String?      @map("blob_hash") @db.Text // NULL for DELETE
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  blob      Blob?     @relation(fields: [blobHash], references: [blobHash])
+
+  @@unique([workspaceId, filePath])
+  @@map("workspace_changes")
+}
+
+enum PrStatus {
+  OPEN
+  MERGED
+  DIFFING
+  CLOSED
+
+  @@map("pr_status")
+}
+
+// Proposes merging a workspace's commits into the repo main line.
+// MERGED is terminal. Approval state is derived from reviews, not stored here.
+model PullRequest {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  repoId      String   @map("repo_id") @db.Uuid
+  // SetNull on workspace deletion so PR history survives; deleting a workspace
+  // with an OPEN PR is blocked at the app level (known-issues HIGH-06).
+  workspaceId String?  @map("workspace_id") @db.Uuid
+  authorId    String   @map("author_id") @db.Uuid
+  title       String   @db.VarChar(255)
+  description String?  @db.Text
+  status      PrStatus @default(OPEN)
+  prHead      String   @map("pr_head") @db.Text // latest commit included (user-controlled); immutable once MERGED
+  baseCommit  String?  @map("base_commit") @db.Text // computed merge_base frozen at merge time; NULL while open
+  mergeCommit String?  @map("merge_commit") @db.Text // resulting merge/fast-forward commit; NULL until merged
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  repo           Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  workspace      Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  author         User       @relation("PrAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  prHeadRef      Commit     @relation("PrHeadCommit", fields: [prHead], references: [commitHash])
+  baseCommitRef  Commit?    @relation("PrBaseCommit", fields: [baseCommit], references: [commitHash])
+  mergeCommitRef Commit?    @relation("PrMergeCommit", fields: [mergeCommit], references: [commitHash])
+
+  reviews     PrReview[]
+  comments    PrComment[]
+  mergeStates MergeState[]
+
+  @@index([repoId, status])
+  @@index([workspaceId])
+  @@map("pull_requests")
+}
+
+enum ReviewVerdict {
+  PENDING
+  APPROVED
+  CHANGES_REQUESTED
+  PR_CLOSED
+
+  @@map("review_verdict")
+}
+
+model PrReview {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  prId       String        @map("pr_id") @db.Uuid
+  reviewerId String        @map("reviewer_id") @db.Uuid
+  verdict    ReviewVerdict
+  body       String?       @db.Text
+  createdAt  DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  pr       PullRequest @relation(fields: [prId], references: [id], onDelete: Cascade)
+  reviewer User        @relation(fields: [reviewerId], references: [id], onDelete: Cascade)
+
+  @@index([prId])
+  @@map("pr_reviews")
+}
+
+// General (filePath NULL) or file-level comments. No line-level comments —
+// that needs content-level merge, a future feature.
+model PrComment {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  prId      String   @map("pr_id") @db.Uuid
+  authorId  String   @map("author_id") @db.Uuid
+  body      String   @db.Text
+  filePath  String?  @map("file_path") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  pr     PullRequest @relation(fields: [prId], references: [id], onDelete: Cascade)
+  author User        @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([prId])
+  @@map("pr_comments")
+}
+
+enum MergeStatus {
+  IN_PROGRESS
+  RESOLVED
+  ABORTED
+
+  @@map("merge_status")
+}
+
+// Tracks a diverged (three-way) merge operation. Created only when the merge
+// is not a fast-forward.
+model MergeState {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  prId         String      @map("pr_id") @db.Uuid
+  workspaceId  String      @map("workspace_id") @db.Uuid
+  baseCommit   String      @map("base_commit") @db.Text // common ancestor, computed via merge_base()
+  oursCommit   String      @map("ours_commit") @db.Text // repo HEAD at merge time
+  theirsCommit String      @map("theirs_commit") @db.Text // pr_head at merge time
+  status       MergeStatus @default(IN_PROGRESS)
+  mergedTree   String?     @map("merged_tree") @db.Text // auto-merged root tree; NULL until built
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  pr              PullRequest @relation(fields: [prId], references: [id], onDelete: Cascade)
+  workspace       Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  baseCommitRef   Commit      @relation("MergeStateBase", fields: [baseCommit], references: [commitHash])
+  oursCommitRef   Commit      @relation("MergeStateOurs", fields: [oursCommit], references: [commitHash])
+  theirsCommitRef Commit      @relation("MergeStateTheirs", fields: [theirsCommit], references: [commitHash])
+  mergedTreeRef   Tree?       @relation("MergeStateMergedTree", fields: [mergedTree], references: [treeHash])
+
+  conflicts MergeConflict[]
+
+  @@index([prId])
+  @@map("merge_states")
+}
+
+enum ConflictType {
+  EDIT_EDIT
+  DELETE_EDIT
+  ADD_ADD
+  DIR_FILE
+
+  @@map("conflict_type")
+}
+
+enum ConflictResolution {
+  PENDING
+  TAKE_OURS
+  TAKE_THEIRS
+  MANUAL
+
+  @@map("conflict_resolution")
+}
+
+// One row per conflicted file path. Resolved at the whole-file level
+// (hunk-level resolution is a future feature — see content_merge spec).
+model MergeConflict {
+  id           String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mergeStateId String             @map("merge_state_id") @db.Uuid
+  filePath     String             @map("file_path") @db.Text
+  conflictType ConflictType       @map("conflict_type")
+  baseBlob     String?            @map("base_blob") @db.Text // NULL if file didn't exist in BASE
+  oursBlob     String?            @map("ours_blob") @db.Text // NULL if deleted in OURS
+  theirsBlob   String?            @map("theirs_blob") @db.Text // NULL if deleted in THEIRS
+  resolvedBlob String?            @map("resolved_blob") @db.Text // NULL until resolved (or resolved as delete)
+  resolution   ConflictResolution @default(PENDING)
+  resolvedAt   DateTime?          @map("resolved_at") @db.Timestamptz
+
+  mergeState      MergeState @relation(fields: [mergeStateId], references: [id], onDelete: Cascade)
+  baseBlobRef     Blob?      @relation("ConflictBaseBlob", fields: [baseBlob], references: [blobHash])
+  oursBlobRef     Blob?      @relation("ConflictOursBlob", fields: [oursBlob], references: [blobHash])
+  theirsBlobRef   Blob?      @relation("ConflictTheirsBlob", fields: [theirsBlob], references: [blobHash])
+  resolvedBlobRef Blob?      @relation("ConflictResolvedBlob", fields: [resolvedBlob], references: [blobHash])
+
+  @@unique([mergeStateId, filePath])
+  @@map("merge_conflicts")
+}
